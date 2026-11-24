@@ -1475,28 +1475,25 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
         return S_OK;
     }
+    if let Some(p) = super::title_textures::address(this as usize)
+        .or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied()))
+    {
+        if !data.is_null() {
+            *data = p as *mut c_void;
+        }
+        UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+        return S_OK;
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
     let hr = f(this, sub, range, data);
-    if hr >= 0 {
-        return hr;
-    }
-    match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
-        Some(p) => {
-            if !data.is_null() {
-                *data = p as *mut c_void;
-            }
-            UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
-            S_OK
-        }
-        None => {
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
-                crate::xlog_warn!("D3D12.X: Map of a resource not in unified memory → {:#x} ({:?})", hr as u32, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)));
-            }
-            hr
+    if hr < 0 {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+            crate::xlog_warn!("D3D12.X: Map of a resource not in unified memory → {:#x} ({:?})", hr as u32, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)));
         }
     }
+    hr
 }
 
 /// WriteToSubresource(subresource, box, data, row pitch, depth pitch): the CPU writing texels.
@@ -5762,6 +5759,181 @@ mod console_format_query_tests {
             let d: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&x).as_ptr() as *const _) };
             let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod res_map_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    static PC_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PC_UNMAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn fake_qi(_: *mut c_void, _: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+        if !ppv.is_null() {
+            *ppv = std::ptr::null_mut();
+        }
+        E_NOINTERFACE
+    }
+
+    unsafe extern "system" fn fake_ref(_: *mut c_void) -> u32 {
+        1
+    }
+
+    unsafe extern "system" fn fake_noop(_: *mut c_void) -> HRESULT {
+        S_OK
+    }
+
+    unsafe extern "system" fn fake_map(_: *mut c_void, _: u32, _: *const c_void, _: *mut *mut c_void) -> HRESULT {
+        PC_MAP_CALLS.fetch_add(1, Ordering::AcqRel);
+        E_INVALIDARG
+    }
+
+    unsafe extern "system" fn fake_unmap(_: *mut c_void, _: u32, _: *const c_void) {
+        PC_UNMAP_CALLS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    unsafe extern "system" fn fake_get_desc(_: *mut c_void, out: *mut D3D12_RESOURCE_DESC) -> *mut D3D12_RESOURCE_DESC {
+        *out = D3D12_RESOURCE_DESC::default();
+        out
+    }
+
+    fn clear_tracking(key: usize) {
+        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+            m.remove(&key);
+        }
+        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+            s.remove(&key);
+        }
+    }
+
+    #[test]
+    fn res_map_returns_title_address_without_calling_pc_map() {
+        PC_MAP_CALLS.store(0, Ordering::Release);
+        PC_UNMAP_CALLS.store(0, Ordering::Release);
+
+        let fake_vt: &'static [usize; 16] = Box::leak(Box::new([
+            fake_qi as usize,
+            fake_ref as usize,
+            fake_ref as usize,
+            fake_noop as usize,
+            fake_noop as usize,
+            fake_noop as usize,
+            fake_noop as usize,
+            fake_noop as usize,
+            fake_map as usize,
+            fake_unmap as usize,
+            fake_get_desc as usize,
+            fake_noop as usize,
+            fake_noop as usize,
+            fake_noop as usize,
+            fake_noop as usize,
+            0,
+        ]));
+        let mut obj = [fake_vt.as_ptr() as usize];
+        let this = obj.as_mut_ptr() as *mut c_void;
+        let key = this as usize;
+        let va = 0x255B_0950_0000usize;
+
+        unsafe {
+            adopt(this, Kind::Resource);
+            note_title_address(key, va);
+
+            let map: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(*vt(this).add(8));
+            let unmap: unsafe extern "system" fn(*mut c_void, u32, *const c_void) =
+                std::mem::transmute(*vt(this).add(9));
+
+            let mut data: *mut c_void = std::ptr::null_mut();
+            let hr = map(this, 0, std::ptr::null(), &mut data);
+            unmap(this, 0, std::ptr::null());
+            let hr_null = map(this, 0, std::ptr::null(), std::ptr::null_mut());
+            unmap(this, 0, std::ptr::null());
+            clear_tracking(key);
+
+            assert_eq!(hr, S_OK);
+            assert_eq!(hr_null, S_OK);
+            assert_eq!(data as usize, va);
+            assert_eq!(PC_MAP_CALLS.load(Ordering::Acquire), 0, "placed texture Map must not call PC ID3D12Resource::Map");
+            assert_eq!(PC_UNMAP_CALLS.load(Ordering::Acquire), 0, "placed texture Unmap must not call PC ID3D12Resource::Unmap");
+
+            // Without a title address, res_map still forwards to PC ID3D12Resource::Map.
+            let mut data2: *mut c_void = std::ptr::null_mut();
+            let hr2 = map(this, 0, std::ptr::null(), &mut data2);
+            assert_eq!(hr2, E_INVALIDARG);
+            assert_eq!(PC_MAP_CALLS.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
+    fn gpu_map_of_placed_reserved_texture_skips_pc_map() {
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let dev = dev.unwrap();
+        let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        if unsafe {
+            dev.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                &mut opts as *mut _ as *mut c_void,
+                std::mem::size_of_val(&opts) as u32,
+            )
+        }
+        .is_err()
+            || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+        {
+            crate::gpu::recomp::runner::skip_test("no tiled resources tier 2");
+            return;
+        }
+
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let mut res: Option<ID3D12Resource> = None;
+        unsafe { dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res) }
+            .expect("CreateReservedResource 64x64 R8G8B8A8");
+        let res = res.unwrap();
+        let raw = res.as_raw();
+        let key = raw as usize;
+        let va = 0x255B_0950_0000usize;
+
+        let info_queue: Option<ID3D12InfoQueue> = dev.cast().ok();
+        let msgs_before = info_queue.as_ref().map(|q| unsafe { q.GetNumStoredMessages() }).unwrap_or(0);
+
+        unsafe {
+            adopt(raw, Kind::Resource);
+            note_title_address(key, va);
+
+            let map: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(*vt(raw).add(8));
+            let unmap: unsafe extern "system" fn(*mut c_void, u32, *const c_void) =
+                std::mem::transmute(*vt(raw).add(9));
+
+            for _ in 0..2 {
+                let mut mapped: *mut c_void = std::ptr::null_mut();
+                let hr = map(raw, 0, std::ptr::null(), &mut mapped);
+                assert_eq!(hr, S_OK);
+                assert_eq!(mapped as usize, va);
+                unmap(raw, 0, std::ptr::null());
+            }
+
+            if let Some(q) = &info_queue {
+                assert_eq!(q.GetNumStoredMessages(), msgs_before, "reserved resource Map must emit no debug-layer errors");
+            }
+            clear_tracking(key);
         }
     }
 }
