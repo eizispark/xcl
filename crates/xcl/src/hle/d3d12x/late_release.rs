@@ -21,8 +21,13 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
 /// how often the thread here looks for batches that can go
 const TICK: Duration = Duration::from_millis(4);
 
+struct Item {
+    raw: usize,
+    after: Option<Box<dyn FnOnce() + Send>>,
+}
+
 struct Batch {
-    dead: Vec<usize>,
+    dead: Vec<Item>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -31,7 +36,7 @@ struct Batch {
 struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
-    open: Vec<usize>,
+    open: Vec<Item>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -46,7 +51,7 @@ impl Held {
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<Item> {
         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -100,7 +105,16 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
 /// before. Otherwise the thread here lets it go.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+    hold_item(Item { raw: res, after: None });
+}
+
+/// `hold`, running `after` once `obj`'s last reference has been released.
+pub unsafe fn hold_with(obj: usize, after: impl FnOnce() + Send + 'static) {
+    hold_item(Item { raw: obj, after: Some(Box::new(after)) });
+}
+
+unsafe fn hold_item(item: Item) {
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(item);
     let start = Instant::now();
     drain_known(true);
     while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
@@ -125,7 +139,7 @@ pub unsafe fn hold(res: usize) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+    if (!seal_now && super::title_textures::is_own_work()) || HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
     let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
@@ -142,9 +156,12 @@ pub unsafe fn drain_known(seal_now: bool) {
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
-    for res in gone {
-        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
-        f(res as *mut c_void);
+    for item in gone {
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(item.raw as *mut c_void, 2));
+        f(item.raw as *mut c_void);
+        if let Some(after) = item.after {
+            after();
+        }
     }
 }
 
@@ -180,7 +197,7 @@ mod tests {
             let raw = res.unwrap().into_raw() as usize;
 
             let mut held = Held::default();
-            held.open.push(raw);
+            held.open.push(Item { raw, after: None });
             let queues = [queue.clone()];
             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
@@ -194,7 +211,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 gone = held.drain(&queues, false);
             }
-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
+            assert_eq!(gone.into_iter().map(|i| i.raw).collect::<Vec<_>>(), vec![raw], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
@@ -204,8 +221,8 @@ mod tests {
     #[test]
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
-        held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        held.open.push(Item { raw: 0x1000, after: None });
+        assert_eq!(unsafe { held.drain(&[], false) }.into_iter().map(|i| i.raw).collect::<Vec<_>>(), vec![0x1000]);
         assert!(held.is_empty());
     }
 }

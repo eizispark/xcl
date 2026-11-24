@@ -21,7 +21,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 use windows::core::{Interface, PCSTR};
@@ -1591,6 +1591,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
+    let mut heap_uma = None;
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1607,6 +1608,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
+        heap_uma = RESOURCE_HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
@@ -1620,7 +1622,10 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
     }
     if held {
-        super::late_release::hold(this as usize);
+        match heap_uma {
+            Some(b) => super::late_release::hold_with(this as usize, move || drop(b)),
+            None => super::late_release::hold(this as usize),
+        }
     }
     n
 }
@@ -2765,11 +2770,15 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
         if let Some((block, cpu_readback)) = is_buffer.then(|| heap_block(heap)).flatten() {
             let d = super::device_x::pc_resource_desc(&x);
             let st = state as u32 & PC_RESOURCE_STATES;
-            if let Some(hr) = place_at_title_address(this, block + offset, &d, st, clear as *const c_void, riid, ppv) {
-                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(block + offset)) {
-                    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
-                    if st == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32 && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) == 0 {
-                        note_sparse_readback(*ppv as usize);
+            let va = block.0 + offset;
+            if let Some(hr) = place_at_title_address(this, va, &d, st, clear as *const c_void, riid, ppv) {
+                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+                    RESOURCE_HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, block);
+                    if cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va)) {
+                        let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+                        if st == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32 && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) == 0 {
+                            note_sparse_readback(*ppv as usize);
+                        }
                     }
                 }
                 return hr;
@@ -2972,6 +2981,20 @@ pub(super) unsafe extern "system" fn dev_create_heap1(this: *mut c_void, desc: u
     hr
 }
 
+struct HeapUmaBlock(usize);
+
+impl Drop for HeapUmaBlock {
+    fn drop(&mut self) {
+        if let Some(u) = crate::gpu::uma::get() {
+            if u.is_sparse(self.0) {
+                unsafe { super::sparse::free(self.0) };
+            } else {
+                u.free(self.0);
+            }
+        }
+    }
+}
+
 struct HeapUma {
     size: usize,
     align: usize,
@@ -2980,12 +3003,14 @@ struct HeapUma {
     /// `READBACK` or `CUSTOM + WRITE_BACK`: if backed by sparse VRAM, `COPY_DEST` buffers placed
     /// in it read back on `Map(0, NULL, ...)`.
     cpu_readback: bool,
-    block: Option<usize>,
+    block: Option<Arc<HeapUmaBlock>>,
 }
 
 /// heap → its backing block (allocated lazily on the first placed buffer; sparse VRAM for
 /// DEFAULT/UPLOAD/CUSTOM heaps, coherent committed window for small explicit READBACK heaps)
 static HEAP_UMA: Mutex<Option<HashMap<usize, HeapUma>>> = Mutex::new(None);
+/// placed buffer → its heap's `HEAP_UMA` block, kept until both the buffer and in-flight work go
+static RESOURCE_HEAP_UMA: Mutex<Option<HashMap<usize, Arc<HeapUmaBlock>>>> = Mutex::new(None);
 
 /// A heap the title made that may hold buffers: a block of unified memory as large stands for
 /// it. On the console every heap is memory the CPU and the GPU address alike, and console code
@@ -3022,12 +3047,12 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
 
 /// The block of unified memory standing for `heap` and whether it may hold CPU-readback buffers
 /// (taken now if it has none yet; None: not a heap that takes one, or unified memory is full).
-fn heap_block(heap: usize) -> Option<(usize, bool)> {
+fn heap_block(heap: usize) -> Option<(Arc<HeapUmaBlock>, bool)> {
     let (size, align, prefer_coherent, cpu_readback) = {
         let g = HEAP_UMA.lock().unwrap();
         let e = g.as_ref()?.get(&heap)?;
-        if let Some(p) = e.block {
-            return Some((p, e.cpu_readback));
+        if let Some(ref b) = e.block {
+            return Some((Arc::clone(b), e.cpu_readback));
         }
         (e.size, e.align, e.prefer_coherent, e.cpu_readback)
     };
@@ -3054,48 +3079,52 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
         }
         return None;
     };
+    let block = Arc::new(HeapUmaBlock(p));
     let mut g = HEAP_UMA.lock().unwrap();
     let Some(e) = g.as_mut().and_then(|m| m.get_mut(&heap)) else {
         drop(g);
-        if u.is_sparse(p) {
-            unsafe { super::sparse::free(p) };
-        } else {
-            u.free(p);
-        }
         return None;
     };
-    if let Some(existing) = e.block {
-        let cr = e.cpu_readback;
+    if let Some(ref existing) = e.block {
+        let out = (Arc::clone(existing), e.cpu_readback);
         drop(g);
-        if u.is_sparse(p) {
-            unsafe { super::sparse::free(p) };
-        } else {
-            u.free(p);
-        }
-        return Some((existing, cr));
+        return Some(out);
     }
-    e.block = Some(p);
+    e.block = Some(Arc::clone(&block));
     drop(g);
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 4 {
         let kind = if u.is_sparse(p) { "sparse VRAM" } else { "coherent RAM" };
         crate::xlog_info!("D3D12.X: heap {heap:#x} ({size:#x} bytes) holds buffers: in {kind} at {p:#x}");
     }
-    Some((p, cpu_readback))
+    Some((block, cpu_readback))
 }
 
-/// ID3D12Heap::Release: its block of unified memory goes with it.
+/// ID3D12Heap::Release: held until GPU queues pass in-flight work, then its UMA block goes too.
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let mut held = false;
+    let n = if super::late_release::enabled() {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        if add(this) == 2 {
+            f(this);
+            held = true;
+            0
+        } else {
+            f(this);
+            f(this)
+        }
+    } else {
+        f(this)
+    };
     if n == 0 {
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
-        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
+        if held {
+            match gone {
+                Some(b) => super::late_release::hold_with(this as usize, move || drop(b)),
+                None => super::late_release::hold(this as usize),
             }
+            return 0;
         }
     }
     n
@@ -6207,6 +6236,122 @@ mod map_tests {
                 m.remove(&(raw as usize));
                 m.remove(&(upload.as_raw() as usize));
             }
+        }
+    }
+
+    /// A buffer heap's `HEAP_UMA` block stays allocated and untouched while a placed buffer on it
+    /// is still alive or a GPU queue has not yet passed the batch fence (#1394), and goes back once
+    /// both have finished.
+    #[test]
+    fn mem_heap_release_holds_uma_backing_until_placed_resources_and_queues_finish() {
+        let Some(u) = crate::gpu::uma::get() else {
+            return crate::gpu::recomp::runner::skip_test("no unified memory");
+        };
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            adopt(dev.as_raw(), Kind::Device);
+            if UMA_BUFFER.lock().unwrap().is_empty() {
+                open_uma(&dev);
+            }
+            if UMA_BUFFER.lock().unwrap().is_empty() {
+                return crate::gpu::recomp::runner::skip_test("no GPU UMA");
+            }
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+
+            let hdesc = D3D12_HEAP_DESC {
+                SizeInBytes: 0x1_0000,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&hdesc, &mut heap).unwrap();
+            let heap = heap.unwrap();
+
+            let bdesc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 0x1_0000,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const GUID;
+            let mut r_raw = std::ptr::null_mut();
+            let hr = dev_create_placed_resource_x(dev.as_raw(), heap.as_raw() as usize, 0, &bdesc as *const _ as usize, D3D12_RESOURCE_STATE_COPY_DEST.0 as usize, 0, riid, &mut r_raw);
+            assert!(hr >= 0 && !r_raw.is_null(), "placed buffer on READBACK heap: {hr:#x}");
+            let r = ID3D12Resource::from_raw(r_raw);
+            let (va, len) = console_buffer(r_raw as usize).expect("placed in HEAP_UMA");
+            assert_eq!(len, 0x1_0000);
+            assert!(!u.is_sparse(va));
+            std::ptr::write_bytes(va as *mut u8, 0xA5, 256);
+
+            let probe_has = |target: usize| {
+                let probes: Vec<*mut u8> = (0..8).filter_map(|_| u.alloc(0x1_0000, 0x1_0000)).collect();
+                let hit = probes.iter().any(|&p| p as usize == target);
+                for p in probes {
+                    u.free(p as usize);
+                }
+                hit
+            };
+
+            // (a) Heap released while placed resource `r` is still alive: block must stay live and unzeroed.
+            drop(heap);
+            assert!(!probe_has(va), "mem_heap_release freed HEAP_UMA block while placed resource is still alive");
+            assert_eq!(std::ptr::read_volatile(va as *const u8), 0xA5, "placed buffer zeroed when heap was released");
+
+            // (b) Resource released too, while `queue` is still blocked on `gate`: block stays live.
+            drop(r);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            super::super::late_release::drain_known(false);
+            assert!(!probe_has(va), "HEAP_UMA block freed while GPU queue still has work in flight");
+            assert_eq!(std::ptr::read_volatile(va as *const u8), 0xA5, "in-flight buffer zeroed before fence");
+
+            // (c) Queue passes the fence: both held releases complete and the block returns to UMA.
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            let mut reclaimed = false;
+            while !reclaimed && start.elapsed() < std::time::Duration::from_secs(5) {
+                super::super::late_release::drain_known(false);
+                if probe_has(va) {
+                    reclaimed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(reclaimed, "HEAP_UMA block was not returned after GPU queue finished");
+
+            // (d) Reverse order (`r2` released before `heap2` while `queue` is busy): also held until fence.
+            queue.Wait(&gate, 2).unwrap();
+            let mut heap2: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&hdesc, &mut heap2).unwrap();
+            let heap2 = heap2.unwrap();
+            let mut r2_raw = std::ptr::null_mut();
+            assert!(dev_create_placed_resource_x(dev.as_raw(), heap2.as_raw() as usize, 0, &bdesc as *const _ as usize, D3D12_RESOURCE_STATE_COPY_DEST.0 as usize, 0, riid, &mut r2_raw) >= 0);
+            let (va2, _) = console_buffer(r2_raw as usize).unwrap();
+            std::ptr::write_bytes(va2 as *mut u8, 0x5A, 256);
+            drop(ID3D12Resource::from_raw(r2_raw));
+            drop(heap2);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            super::super::late_release::drain_known(false);
+            assert!(!probe_has(va2) && std::ptr::read_volatile(va2 as *const u8) == 0x5A, "reverse release freed block in flight");
+            gate.Signal(2).unwrap();
+            let start = std::time::Instant::now();
+            while !probe_has(va2) && start.elapsed() < std::time::Duration::from_secs(5) {
+                super::super::late_release::drain_known(false);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(probe_has(va2), "second HEAP_UMA block was not returned after GPU queue finished");
         }
     }
 }
