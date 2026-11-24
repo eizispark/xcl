@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::{Interface, GUID, IUnknown};
@@ -19,22 +19,22 @@ const MAX_STORE_BYTES: usize = 32 << 20;
 struct Store {
     entries: HashMap<Vec<u8>, Vec<u8>>,
     bytes: usize,
+    delete_on_destroy: bool,
 }
 
 impl Store {
     fn new() -> Self {
-        Self { entries: HashMap::new(), bytes: 0 }
+        Self { entries: HashMap::new(), bytes: 0, delete_on_destroy: false }
     }
 
     fn insert(&mut self, key: Vec<u8>, val: Vec<u8>) {
-        if let Some(old) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(key.len() + old.len());
-        }
         let cost = key.len().saturating_add(val.len());
-        if self.bytes.saturating_add(cost) > MAX_STORE_BYTES {
+        let old_cost = self.entries.get(&key).map_or(0, |old| key.len() + old.len());
+        let next_bytes = self.bytes.saturating_sub(old_cost).saturating_add(cost);
+        if next_bytes > MAX_STORE_BYTES {
             return;
         }
-        self.bytes += cost;
+        self.bytes = next_bytes;
         self.entries.insert(key, val);
     }
 
@@ -57,7 +57,6 @@ struct Session {
     desc: D3D12_SHADER_CACHE_SESSION_DESC,
     store: Arc<Mutex<Store>>,
     shared_key: Option<(u128, u64)>,
-    delete_on_destroy: AtomicBool,
 }
 
 fn vtbl() -> &'static [usize; 12] {
@@ -90,6 +89,9 @@ pub(super) unsafe fn create_fallback(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
+    if !ppv.is_null() {
+        *ppv = std::ptr::null_mut();
+    }
     if desc.is_null() || riid.is_null() {
         return E_INVALIDARG;
     }
@@ -121,7 +123,6 @@ pub(super) unsafe fn create_fallback(
         desc: d,
         store,
         shared_key,
-        delete_on_destroy: AtomicBool::new(false),
     });
     *ppv = Box::into_raw(obj) as *mut c_void;
     S_OK
@@ -150,15 +151,27 @@ unsafe extern "system" fn add_ref(this: *mut Session) -> u32 {
 unsafe extern "system" fn release(this: *mut Session) -> u32 {
     let prev = (*this).refs.fetch_sub(1, Ordering::AcqRel);
     if prev == 1 {
-        let boxed = Box::from_raw(this);
-        if boxed.delete_on_destroy.load(Ordering::Acquire) {
-            boxed.store.lock().unwrap().clear();
-            if let Some(k) = boxed.shared_key {
-                disk_stores().lock().unwrap().remove(&k);
+        let Session { device, store, shared_key, .. } = *Box::from_raw(this);
+        match shared_key {
+            Some(k) => {
+                let mut map = disk_stores().lock().unwrap();
+                let same = map.get(&k).is_some_and(|m| Arc::ptr_eq(m, &store));
+                drop(store);
+                if same && map.get(&k).is_some_and(|m| Arc::strong_count(m) == 1 && m.lock().unwrap().delete_on_destroy) {
+                    if let Some(removed) = map.remove(&k) {
+                        removed.lock().unwrap().clear();
+                    }
+                }
+            }
+            None => {
+                let mut g = store.lock().unwrap();
+                if g.delete_on_destroy {
+                    g.clear();
+                }
             }
         }
-        if !boxed.device.is_null() {
-            drop(ID3D12Device::from_raw(boxed.device));
+        if !device.is_null() {
+            drop(ID3D12Device::from_raw(device));
         }
         return 0;
     }
@@ -249,7 +262,7 @@ unsafe extern "system" fn store_value(
 }
 
 unsafe extern "system" fn set_delete_on_destroy(this: *mut Session) {
-    (*this).delete_on_destroy.store(true, Ordering::Release);
+    (*this).store.lock().unwrap().delete_on_destroy = true;
 }
 
 unsafe extern "system" fn get_desc(
@@ -329,6 +342,100 @@ mod tests {
             session.SetDeleteOnDestroy();
             drop(session);
             assert!(!disk_stores().lock().unwrap().contains_key(&(id.to_u128(), 7)));
+        }
+    }
+
+    unsafe fn fallback_session(desc: &D3D12_SHADER_CACHE_SESSION_DESC) -> ID3D12ShaderCacheSession {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        assert_eq!(create_fallback(std::ptr::null_mut(), desc, &ID3D12ShaderCacheSession::IID, &mut raw), S_OK);
+        ID3D12ShaderCacheSession::from_raw(raw)
+    }
+
+    #[test]
+    fn shared_disk_store_waits_for_last_session_before_honoring_delete_on_destroy() {
+        unsafe {
+            let id = GUID::from_u128(0x11223344_5566_4778_899a_bbccddeeff01);
+            let desc = D3D12_SHADER_CACHE_SESSION_DESC {
+                Identifier: id,
+                Mode: D3D12_SHADER_CACHE_MODE_DISK,
+                Flags: D3D12_SHADER_CACHE_FLAG_NONE,
+                MaximumInMemoryCacheSizeBytes: 1024,
+                MaximumInMemoryCacheEntries: 16,
+                MaximumValueFileSizeBytes: 4096,
+                Version: 19,
+            };
+            let s1 = fallback_session(&desc);
+            let s2 = fallback_session(&desc);
+
+            let key = b"vs-entry";
+            let blob = b"dxil-shader-bytes";
+            s1.StoreValue(key.as_ptr() as *const c_void, key.len() as u32, blob.as_ptr() as *const c_void, blob.len() as u32).unwrap();
+
+            let mut out = vec![0u8; blob.len()];
+            let mut sz = out.len() as u32;
+            s2.FindValue(key.as_ptr() as *const c_void, key.len() as u32, out.as_mut_ptr() as *mut c_void, &mut sz).unwrap();
+            assert_eq!(out, blob);
+
+            // Marking delete-on-destroy on s1 and closing s1 must keep the shared store intact while s2 lives.
+            s1.SetDeleteOnDestroy();
+            drop(s1);
+
+            out.fill(0);
+            sz = out.len() as u32;
+            s2.FindValue(key.as_ptr() as *const c_void, key.len() as u32, out.as_mut_ptr() as *mut c_void, &mut sz)
+                .expect("shared store stays populated while another session is open");
+            assert_eq!(out, blob);
+
+            let s3 = fallback_session(&desc);
+            out.fill(0);
+            sz = out.len() as u32;
+            s3.FindValue(key.as_ptr() as *const c_void, key.len() as u32, out.as_mut_ptr() as *mut c_void, &mut sz)
+                .expect("new session opened before last release shares the same store");
+            assert_eq!(out, blob);
+            drop(s3);
+
+            // Closing the last open session (even one that did not call SetDeleteOnDestroy itself) deletes the store.
+            drop(s2);
+            assert!(!disk_stores().lock().unwrap().contains_key(&(id.to_u128(), 19)));
+
+            let s4 = fallback_session(&desc);
+            let mut miss_sz = 0u32;
+            let miss = s4.FindValue(key.as_ptr() as *const c_void, key.len() as u32, std::ptr::null_mut(), &mut miss_sz);
+            assert_eq!(miss.unwrap_err().code().0, DXGI_ERROR_NOT_FOUND);
+            s4.SetDeleteOnDestroy();
+            drop(s4);
+        }
+    }
+
+    #[test]
+    fn oversized_replacement_preserves_existing_entry_and_failed_create_clears_ppv() {
+        let mut store = Store::new();
+        let key = b"pso-0".to_vec();
+        let orig = b"valid-cached-dxil".to_vec();
+        let expected_bytes = key.len() + orig.len();
+        store.insert(key.clone(), orig.clone());
+        assert_eq!(store.bytes, expected_bytes);
+
+        store.insert(key.clone(), vec![0xAB; MAX_STORE_BYTES]);
+        assert_eq!(store.entries.get(key.as_slice()).map(Vec::as_slice), Some(orig.as_slice()));
+        assert_eq!(store.bytes, expected_bytes);
+
+        unsafe {
+            let desc = D3D12_SHADER_CACHE_SESSION_DESC {
+                Identifier: GUID::from_u128(0x22334455_6677_4889_9aab_ccddeeff0012),
+                Mode: D3D12_SHADER_CACHE_MODE_MEMORY,
+                ..Default::default()
+            };
+            let mut out: *mut c_void = 1usize as *mut c_void;
+            assert_eq!(create_fallback(std::ptr::null_mut(), std::ptr::null(), &ID3D12ShaderCacheSession::IID, &mut out), E_INVALIDARG);
+            assert!(out.is_null());
+
+            out = 1usize as *mut c_void;
+            let bad_iid = GUID::from_u128(1);
+            assert_eq!(create_fallback(std::ptr::null_mut(), &desc, &bad_iid, &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+
+            assert_eq!(create_fallback(std::ptr::null_mut(), &desc, &ID3D12ShaderCacheSession::IID, std::ptr::null_mut()), S_FALSE);
         }
     }
 }
